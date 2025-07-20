@@ -1,0 +1,171 @@
+#!/bin/bash
+#SBATCH --job-name=alzheimer_requirement_ranking
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=0:30:00
+#SBATCH --output=alzheimer_requirement_ranking_%j.out
+#SBATCH --error=alzheimer_requirement_ranking_%j.err
+
+# Load R module
+module load R/4.4.2-gfbf-2024a
+
+# Run R script
+R --vanilla << 'EOF'
+
+# Load required libraries
+library(data.table)
+
+# Set file paths
+input_file <- "/mnt/vstor/SOM_EPBI_SKI/PHONOLOGY/PGSSKATO/06_Alzheimer_results/alzheimer_pgs_complete_analysis.tsv"
+output_file <- "/mnt/vstor/SOM_EPBI_SKI/PHONOLOGY/PGSSKATO/06_Alzheimer_results/alzheimer_pgs_complete_analysis_requirement_ranked.tsv"
+
+print("=== ALZHEIMER'S PGS REQUIREMENT-BASED RANKING ANALYSIS ===")
+print(paste("Looking for input file:", input_file))
+print(paste("Will save output to:", output_file))
+
+# Check if input file exists
+if (!file.exists(input_file)) {
+  print(paste("ERROR: Input file not found:", input_file))
+  stop("Cannot proceed without input file")
+}
+
+# Read the data
+print("Reading data...")
+data <- fread(input_file)
+
+print(paste("Loaded", nrow(data), "rows"))
+print("Column names:")
+print(names(data))
+
+# Check for required columns
+required_cols <- c("p_value", "Welch_p_value", "Wilcoxon_p_value", "Recommendation")
+missing_cols <- setdiff(required_cols, names(data))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# Create Requirement_met column
+print("Calculating requirement scores...")
+
+# Function to calculate requirement score for each row
+calculate_requirement_score <- function(p_value, welch_p, wilcoxon_p, recommendation) {
+  score <- 0
+  
+  # Check linear regression p-value < 0.05
+  if (!is.na(p_value) && p_value < 0.05) {
+    score <- score + 1
+  }
+  
+  # Check recommended stratification test p-value < 0.05
+  stratification_p <- ifelse(recommendation == "Welch", welch_p, wilcoxon_p)
+  if (!is.na(stratification_p) && stratification_p < 0.05) {
+    score <- score + 1
+  }
+  
+  return(score)
+}
+
+# Apply the function to calculate requirement scores
+data[, Requirement_met := mapply(calculate_requirement_score, 
+                                 p_value, 
+                                 Welch_p_value, 
+                                 Wilcoxon_p_value, 
+                                 Recommendation)]
+
+# Create ranking scores (same as before)
+print("Calculating ranking scores...")
+
+# Function to calculate ranking score for each row
+calculate_ranking_score <- function(p_value, welch_p, wilcoxon_p, recommendation) {
+  # Use the recommended test p-value
+  stratification_p <- ifelse(recommendation == "Welch", welch_p, wilcoxon_p)
+  
+  # Handle missing values
+  if (is.na(p_value) || is.na(stratification_p)) {
+    return(NA)
+  }
+  
+  # Calculate ranking score: (1 - linear_p) * (1 - stratification_p)
+  ranking_score <- (1 - p_value) * (1 - stratification_p)
+  
+  return(ranking_score)
+}
+
+# Apply the function to calculate ranking scores
+data[, Ranking_Score := mapply(calculate_ranking_score, 
+                               p_value, 
+                               Welch_p_value, 
+                               Wilcoxon_p_value, 
+                               Recommendation)]
+
+# Reorder columns to put Requirement_met and Ranking_Score after Sample_size
+if ("Sample_size" %in% names(data)) {
+  # Get column order with new columns after Sample_size
+  col_order <- names(data)
+  col_order <- col_order[!col_order %in% c("Requirement_met", "Ranking_Score")]  # Remove new columns from current positions
+  sample_size_pos <- which(col_order == "Sample_size")
+  
+  # Insert new columns after Sample_size
+  if (length(sample_size_pos) > 0 && sample_size_pos < length(col_order)) {
+    new_order <- c(col_order[1:sample_size_pos], "Requirement_met", "Ranking_Score", col_order[(sample_size_pos + 1):length(col_order)])
+  } else {
+    # If Sample_size is the last column or not found properly
+    new_order <- c(col_order, "Requirement_met", "Ranking_Score")
+  }
+  
+  # Remove any NA values from new_order
+  new_order <- new_order[!is.na(new_order)]
+  
+  print(paste("Reordering columns. New order:", paste(new_order, collapse = ", ")))
+  data <- data[, ..new_order]
+} else {
+  print("Warning: Sample_size column not found, new columns added at the end")
+}
+
+# Nested sorting: first by Requirement_met (descending), then by Ranking_Score (descending)
+print("Performing nested sorting...")
+print("Primary sort: Requirement_met (2 to 0)")
+print("Secondary sort: Ranking_Score (largest to smallest)")
+
+data_ranked <- data[order(-Requirement_met, -Ranking_Score)]
+
+# Save the ranked results
+print("Saving requirement-ranked results...")
+fwrite(data_ranked, output_file, sep = "\t")
+
+print("\n=== REQUIREMENT-BASED RANKING COMPLETE ===")
+print(paste("Ranked results saved to:", output_file))
+print(paste("Total rows:", nrow(data_ranked)))
+
+# Display summary statistics
+print("\n=== REQUIREMENT SCORE DISTRIBUTION ===")
+req_table <- table(data_ranked$Requirement_met, useNA = "ifany")
+print(req_table)
+
+print("\n=== RANKING SCORE STATISTICS BY REQUIREMENT LEVEL ===")
+for (req_level in sort(unique(data_ranked$Requirement_met), decreasing = TRUE)) {
+  subset_data <- data_ranked[Requirement_met == req_level & !is.na(Ranking_Score)]
+  if (nrow(subset_data) > 0) {
+    print(paste("\nRequirement level", req_level, "(", nrow(subset_data), "entries):"))
+    print(summary(subset_data$Ranking_Score))
+  }
+}
+
+# Show top results by requirement level
+print("\n=== TOP RESULTS BY REQUIREMENT LEVEL ===")
+
+for (req_level in sort(unique(data_ranked$Requirement_met), decreasing = TRUE)) {
+  subset_data <- data_ranked[Requirement_met == req_level]
+  if (nrow(subset_data) > 0) {
+    print(paste("\n--- Requirement level", req_level, "---"))
+    top_subset <- head(subset_data[, .(PGS_ID, Clinical_Measure, p_value, Welch_p_value, Wilcoxon_p_value, Recommendation, Requirement_met, Ranking_Score)], 5)
+    print(top_subset)
+  }
+}
+
+print("\n=== OVERALL TOP 10 RESULTS ===")
+top_10_overall <- head(data_ranked[, .(PGS_ID, Clinical_Measure, p_value, Welch_p_value, Wilcoxon_p_value, Recommendation, Requirement_met, Ranking_Score)], 10)
+print(top_10_overall)
+
+EOF
