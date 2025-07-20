@@ -1,0 +1,149 @@
+#!/bin/bash
+#SBATCH --job-name=alzheimer_ranking
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=0:30:00
+#SBATCH --output=alzheimer_ranking_%j.out
+#SBATCH --error=alzheimer_ranking_%j.err
+
+# Load R module
+module load R/4.4.2-gfbf-2024a
+
+# Run R script
+R --vanilla << 'EOF'
+
+# Load required libraries
+library(data.table)
+
+# Set file paths
+input_file <- "/mnt/vstor/SOM_EPBI_SKI/PHONOLOGY/PGSSKATO/06_Alzheimer_results/alzheimer_pgs_complete_analysis.tsv"
+output_file <- "/mnt/vstor/SOM_EPBI_SKI/PHONOLOGY/PGSSKATO/06_Alzheimer_results/alzheimer_pgs_complete_analysis_ranked.tsv"
+
+print("=== ALZHEIMER'S PGS RANKING ANALYSIS ===")
+print(paste("Looking for input file:", input_file))
+print(paste("Will save output to:", output_file))
+
+# Check if input directory exists
+input_dir <- dirname(input_file)
+print(paste("Input directory exists:", dir.exists(input_dir)))
+
+if (dir.exists(input_dir)) {
+  print("Files in input directory:")
+  print(list.files(input_dir))
+}
+
+# Check if input file exists
+if (!file.exists(input_file)) {
+  print(paste("ERROR: Input file not found:", input_file))
+  print("Attempting to find similar files...")
+  
+  # Look for similar files
+  if (dir.exists(input_dir)) {
+    similar_files <- list.files(input_dir, pattern = "alzheimer.*\\.tsv$", full.names = TRUE)
+    if (length(similar_files) > 0) {
+      print("Found similar files:")
+      print(similar_files)
+    }
+  }
+  
+  stop("Cannot proceed without input file")
+}
+
+# Read the data
+print("Reading data...")
+data <- fread(input_file)
+
+print(paste("Loaded", nrow(data), "rows"))
+print("Column names:")
+print(names(data))
+
+# Check for required columns
+required_cols <- c("p_value", "Welch_p_value", "Wilcoxon_p_value", "Recommendation")
+missing_cols <- setdiff(required_cols, names(data))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# Create ranking scores
+print("Calculating ranking scores...")
+
+# Function to calculate ranking score for each row
+calculate_ranking_score <- function(p_value, welch_p, wilcoxon_p, recommendation) {
+  # Use the recommended test p-value
+  stratification_p <- ifelse(recommendation == "Welch", welch_p, wilcoxon_p)
+  
+  # Handle missing values
+  if (is.na(p_value) || is.na(stratification_p)) {
+    return(NA)
+  }
+  
+  # Calculate ranking score: (1 - linear_p) * (1 - stratification_p)
+  ranking_score <- (1 - p_value) * (1 - stratification_p)
+  
+  return(ranking_score)
+}
+
+# Apply the function to calculate ranking scores
+data[, Ranking_Score := mapply(calculate_ranking_score, 
+                               p_value, 
+                               Welch_p_value, 
+                               Wilcoxon_p_value, 
+                               Recommendation)]
+
+# Reorder columns to put Ranking_Score next to Sample_size
+if ("Sample_size" %in% names(data)) {
+  # Get column order with Ranking_Score after Sample_size
+  col_order <- names(data)
+  col_order <- col_order[col_order != "Ranking_Score"]  # Remove Ranking_Score from current position
+  sample_size_pos <- which(col_order == "Sample_size")
+  
+  # Insert Ranking_Score after Sample_size
+  if (length(sample_size_pos) > 0 && sample_size_pos < length(col_order)) {
+    new_order <- c(col_order[1:sample_size_pos], "Ranking_Score", col_order[(sample_size_pos + 1):length(col_order)])
+  } else {
+    # If Sample_size is the last column or not found properly
+    new_order <- c(col_order, "Ranking_Score")
+  }
+  
+  # Remove any NA values from new_order
+  new_order <- new_order[!is.na(new_order)]
+  
+  print(paste("Reordering columns. New order:", paste(new_order, collapse = ", ")))
+  data <- data[, ..new_order]
+} else {
+  print("Warning: Sample_size column not found, Ranking_Score added at the end")
+}
+
+# Sort by Ranking_Score from largest to smallest (descending order)
+print("Sorting by ranking scores...")
+data_ranked <- data[order(-Ranking_Score)]
+
+# Save the ranked results
+print("Saving ranked results...")
+fwrite(data_ranked, output_file, sep = "\t")
+
+print("\n=== RANKING COMPLETE ===")
+print(paste("Ranked results saved to:", output_file))
+print(paste("Total rows:", nrow(data_ranked)))
+
+# Display summary statistics
+print("\n=== RANKING SCORE STATISTICS ===")
+valid_scores <- data_ranked[!is.na(Ranking_Score)]
+print(paste("Valid ranking scores:", nrow(valid_scores)))
+print(paste("Missing ranking scores:", sum(is.na(data_ranked$Ranking_Score))))
+
+if (nrow(valid_scores) > 0) {
+  print("Ranking score distribution:")
+  print(summary(valid_scores$Ranking_Score))
+  
+  print("\nTop 10 highest ranking scores:")
+  top_10 <- head(valid_scores[, .(PGS_ID, Clinical_Measure, p_value, Welch_p_value, Wilcoxon_p_value, Recommendation, Ranking_Score)], 10)
+  print(top_10)
+  
+  print("\nBottom 10 lowest ranking scores:")
+  bottom_10 <- tail(valid_scores[, .(PGS_ID, Clinical_Measure, p_value, Welch_p_value, Wilcoxon_p_value, Recommendation, Ranking_Score)], 10)
+  print(bottom_10)
+}
+
+EOF
